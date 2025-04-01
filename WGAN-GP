@@ -1,0 +1,405 @@
+import os
+from glob import glob
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.autograd import grad
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from sklearn.preprocessing import MinMaxScaler
+from dataset import RoadDataset, rotation_angles  # Keep your original import
+
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# Define Residual Transposed Convolution Block
+class ResUpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResUpBlock, self).__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+        self.shortcut = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.up(x)
+        out = self.bn(out)
+        out += identity  # Residual connection
+        out = self.relu(out)
+        return out
+
+
+# Generator
+class ConvGenerator(nn.Module):
+    def __init__(self, latent_dim=100, output_channels=4, output_height=128, output_width=128):
+        super(ConvGenerator, self).__init__()
+        self.latent_dim = latent_dim
+
+        self.initial = nn.Sequential(
+            nn.Linear(latent_dim, 512 * 8 * 8),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.main = nn.Sequential(
+            ResUpBlock(512, 256),  # 16x16
+            ResUpBlock(256, 128),  # 32x32
+            ResUpBlock(128, 64),  # 64x64
+            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1),  # 128x128
+            nn.Sigmoid()  # Add Sigmoid activation to constrain output to [0, 1]
+        )
+
+    def forward(self, z):
+        x = self.initial(z)
+        x = x.view(-1, 512, 8, 8)
+        out = self.main(x)
+        return out
+
+
+# Discriminator
+class ConvDiscriminator(nn.Module):
+    def __init__(self, input_channels=4, input_height=128, input_width=128):
+        super(ConvDiscriminator, self).__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, kernel_size=8, stride=1, padding=0),
+        )
+
+    def forward(self, x):
+        return self.main(x).view(-1, 1)
+
+
+# Compute gradient penalty
+def compute_gradient_penalty(discriminator, real_samples, fake_samples, device):
+    alpha = torch.rand(real_samples.size(0), 1, 1, 1, device=device)
+    interpolates = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
+    d_interpolates = discriminator(interpolates)
+    fake = torch.ones(real_samples.size(0), 1, device=device)
+    gradients = grad(outputs=d_interpolates, inputs=interpolates, grad_outputs=fake,
+                     create_graph=True, retain_graph=True, only_inputs=True)[0]
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+    return gradient_penalty
+
+
+# Improved visualization that shows physical dimensions
+def visualize_samples(real_data, fake_data, epoch, scaler, save_dir='visualizations'):
+    # Create directory for saving visualizations if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Convert from tensor to numpy
+    real_data = real_data[0].cpu().numpy()  # Shape: [4, 128, 128]
+    fake_data = fake_data[0].cpu().numpy()  # Shape: [4, 128, 128]
+    
+    # Get physical dimensions
+    x_width = 0.35  # 35 cm
+    y_length = 6.0  # 6 m
+    z_height = 0.25  # Adjust based on your data
+    
+    # Extract valid points
+    real_mask = ~np.isclose(real_data[2], 0)  # Non-zero Z values
+    fake_mask = ~np.isclose(fake_data[2], 0)  # Non-zero Z values
+    
+    # Flatten the spatial dimensions to get all points
+    real_x = real_data[0].flatten() * x_width
+    real_y = real_data[1].flatten() * y_length
+    real_z = real_data[2].flatten() * z_height
+    
+    fake_x = fake_data[0].flatten() * x_width
+    fake_y = fake_data[1].flatten() * y_length
+    fake_z = fake_data[2].flatten() * z_height
+    
+    # Create figure with 2 rows and 2 columns
+    plt.figure(figsize=(14, 10))
+    
+    # Row 1: Z vs Y
+    # Real data - Z vs Y
+    plt.subplot(2, 2, 1)
+    plt.scatter(real_y, real_z, c='black', s=3, alpha=0.7)
+    plt.title("Real Data: Z vs Y")
+    plt.xlabel("Y (meters)")
+    plt.ylabel("Z (meters)")
+    plt.xlim(0, y_length)
+    plt.grid(True)
+    
+    # Fake data - Z vs Y
+    plt.subplot(2, 2, 2)
+    plt.scatter(fake_y, fake_z, c='black', s=3, alpha=0.7)
+    plt.title("Generated Data: Z vs Y")
+    plt.xlabel("Y (meters)")
+    plt.ylabel("Z (meters)")
+    plt.xlim(0, y_length)
+    plt.grid(True)
+    
+    # Row 2: Y vs X
+    # Real data - Y vs X
+    plt.subplot(2, 2, 3)
+    plt.scatter(real_x, real_y, c='black', s=3, alpha=0.7)
+    plt.title("Real Data: Y vs X")
+    plt.xlabel("X (meters)")
+    plt.ylabel("Y (meters)")
+    plt.xlim(0, x_width)
+    plt.ylim(0, y_length)
+    plt.grid(True)
+    
+    # Fake data - Y vs X
+    plt.subplot(2, 2, 4)
+    plt.scatter(fake_x, fake_y, c='black', s=3, alpha=0.7)
+    plt.title("Generated Data: Y vs X")
+    plt.xlabel("X (meters)")
+    plt.ylabel("Y (meters)")
+    plt.xlim(0, x_width)
+    plt.ylim(0, y_length)
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.suptitle(f"Training Epoch {epoch}")
+    plt.subplots_adjust(top=0.92)  # Adjust for the title
+    
+    # Save figure instead of showing it
+    plt.savefig(os.path.join(save_dir, f'epoch_{epoch:04d}.png'), dpi=200)
+    plt.close()  # Close figure to free memory
+
+
+# Calculate SSIM and PSNR
+def compute_metrics(real_data, fake_data):
+    real_xyz = real_data[:, :3, :, :].detach().cpu().numpy()
+    fake_xyz = fake_data[:, :3, :, :].detach().cpu().numpy()
+
+    real_flat = real_xyz[0].reshape(3, -1).T
+    fake_flat = fake_xyz[0].reshape(3, -1).T
+
+    data_range = real_flat.max() - real_flat.min()
+    ssim_val = ssim(real_flat, fake_flat, channel_axis=1, data_range=data_range)
+    psnr_val = psnr(real_flat, fake_flat, data_range=data_range)
+    return ssim_val, psnr_val
+
+
+# Data augmentation function - MODIFIED FOR ~30 TOTAL SAMPLES
+def augment_data(normalized_data, augmentation_factor=5):
+    """
+    Create multiple augmented versions of each road profile sample.
+    
+    Args:
+        normalized_data: Numpy array of shape [n_samples, 4, target_rows, target_points]
+        augmentation_factor: Number of augmented samples to create per original sample
+        
+    Returns:
+        Augmented dataset with approximately 30 total samples
+    """
+    print(f"Starting data augmentation: {len(normalized_data)} original samples")
+    augmented_data = []
+    
+    # For each original sample
+    for sample in normalized_data:
+        # Add original sample
+        augmented_data.append(sample.copy())
+        
+        # 1. Add variations with bump height changes (reduced to 2)
+        for scale in [0.85, 1.15]:
+            # Identify the road baseline (minimum height)
+            z_values = sample[2]  # Z coordinates
+            baseline = np.min(z_values)
+            
+            # Scale only the height above baseline (the bump)
+            new_sample = sample.copy()
+            bump_height = z_values - baseline
+            new_sample[2] = baseline + bump_height * scale
+            augmented_data.append(new_sample)
+        
+        # 2. Add variations with bump position shifts (reduced to 2)
+        for shift in [-0.4, 0.4]:
+            new_sample = sample.copy()
+            z_values = sample[2]
+            
+            # Determine bump region (center of the road ~2.5-3.5m)
+            bump_center = int(128 * 3.0 / 6.0)  # Y position at 3m (middle of the road)
+            bump_width = int(128 * 0.8 / 6.0)   # Approx 0.8m width
+            
+            # Create a 1D Gaussian mask for smooth blending
+            y_indices = np.arange(128)
+            bump_mask = np.exp(-0.5 * ((y_indices - bump_center) / (bump_width/2))**2)
+            bump_mask = bump_mask / np.max(bump_mask)
+            
+            # Apply shift by creating a shifted version of the height
+            shift_pixels = int(shift / 6.0 * 128)  # Convert meters to pixels
+            shifted_z = np.zeros_like(z_values)
+            
+            # Apply shift while keeping within bounds
+            for i in range(128):
+                for j in range(128):
+                    new_i = i
+                    new_j = min(max(0, j + shift_pixels), 127)
+                    shifted_z[new_i, new_j] = max(shifted_z[new_i, new_j], z_values[i, j])
+            
+            # Blend original and shifted heights
+            new_sample[2] = shifted_z
+            augmented_data.append(new_sample)
+            
+        # 3. Add noise variation (reduced to 1)
+        new_sample = sample.copy()
+        z_noise = np.random.normal(0, 0.015, sample[2].shape)
+        new_sample[2] = np.clip(sample[2] + z_noise, 0, 1)  # Keep within [0,1]
+        augmented_data.append(new_sample)
+    
+    augmented_data = np.array(augmented_data)
+    print(f"Completed data augmentation: {len(augmented_data)} total samples (target: ~30)")
+    return augmented_data
+
+
+# Modified preprocessing to preserve road features
+def preprocess_data(pcd_files, target_rows=128, target_points=128, apply_augmentation=True):
+    dataset = RoadDataset(pcd_files, rotation_angles, target_rows, target_points)
+    all_data = []
+    
+    # From dictionary to 4D array
+    for sample in dataset:
+        data_list = sample['data']  # List of arrays, each with shape [4, num_points]
+        
+        # Convert to 4D array: [4, target_rows, target_points]
+        sample_data = np.zeros((4, target_rows, target_points))
+        for i, row in enumerate(data_list):
+            sample_data[:, i, :] = row
+        
+        all_data.append(sample_data)
+    
+    all_data = np.array(all_data)  # [n_samples, 4, target_rows, target_points]
+    
+    # Normalize each channel individually to preserve structure
+    n_samples = all_data.shape[0]
+    for s in range(n_samples):
+        for c in range(3):  # Only normalize X, Y, Z
+            min_val = np.min(all_data[s, c])
+            max_val = np.max(all_data[s, c])
+            if max_val > min_val:
+                all_data[s, c] = (all_data[s, c] - min_val) / (max_val - min_val)
+    
+    # Apply data augmentation if requested
+    if apply_augmentation:
+        all_data = augment_data(all_data)
+    
+    return all_data, None  # Return None for scaler as we're not using it
+
+
+def spatial_coherence_loss(fake_data):
+    # Penalize scattered points
+    z_values = fake_data[:, 2]  # Height values [batch, 128, 128]
+    # Calculate local variation and penalize high variation
+    h_var = ((z_values[:, :, 1:] - z_values[:, :, :-1])**2).mean()
+    return h_var * 10.0  # Scaling factor
+
+
+def scan_line_loss(fake_data):
+    # Extract Y vs X data
+    y_values = fake_data[:, 1]  # Y coordinates [batch, 128, 128]
+    # Penalize vertical variation within rows
+    row_var = torch.tensor(0.0, device=fake_data.device)
+    for i in range(128):
+        row = y_values[:, i, :]
+        row_var += torch.var(row, dim=1).mean()
+    return row_var * 5.0
+
+
+# Main training loop
+if __name__ == "__main__":
+    # Hyperparameters
+    latent_dim = 100
+    batch_size = 1
+    n_epochs = 5000
+    n_critic = 5
+    lambda_gp = 15
+    lr = 0.00002
+    beta1 = 0.5
+    beta2 = 0.999
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base_dir = 'data_segment'  # Updated to use a relative path
+    pcd_files = glob(os.path.join(base_dir, '*.pcd'))
+    
+    # Visualization settings
+    save_dir = 'visualizations'
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Will save visualizations every 50 epochs to: {os.path.abspath(save_dir)}")
+
+    # Data preprocessing with improved normalization and augmentation
+    normalized_data, _ = preprocess_data(pcd_files, apply_augmentation=True)
+    
+    # Create TensorDataset and DataLoader
+    tensor_data = torch.tensor(normalized_data, dtype=torch.float32)
+    dataset = torch.utils.data.TensorDataset(tensor_data)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # Initialize models
+    generator = ConvGenerator(latent_dim).to(device)
+    discriminator = ConvDiscriminator().to(device)
+
+    # Optimizers with weight decay
+    optim_g = optim.Adam(generator.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=1e-5)
+    optim_d = optim.Adam(discriminator.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=1e-5)
+
+    # Training loop
+    for epoch in range(n_epochs):
+        for i, (real_data,) in enumerate(dataloader):  # Unpack single tensor
+            real_data = real_data.to(device)  # Already [batch, 4, 128, 128]
+
+            # Train discriminator
+            for _ in range(n_critic):
+                optim_d.zero_grad()
+                z = torch.randn(real_data.size(0), latent_dim).to(device)  # Match batch size
+                fake_data = generator(z)
+                real_validity = discriminator(real_data)
+                fake_validity = discriminator(fake_data)
+                gradient_penalty = compute_gradient_penalty(discriminator, real_data, fake_data, device)
+
+                d_loss = -torch.mean(real_validity) + torch.mean(fake_validity) + lambda_gp * gradient_penalty
+                d_loss.backward()
+                optim_d.step()
+
+            # Train generator
+            optim_g.zero_grad()
+            z = torch.randn(real_data.size(0), latent_dim).to(device)  # Match batch size
+            fake_data = generator(z)
+            fake_validity = discriminator(fake_data)
+
+            # Calculate custom losses
+            coherence_loss = spatial_coherence_loss(fake_data)
+            line_loss = scan_line_loss(fake_data)
+            
+            # Combined loss
+            g_loss = -torch.mean(fake_validity) + coherence_loss + line_loss    
+            g_loss.backward()
+            optim_g.step()
+
+            # Calculate SSIM and PSNR
+            if i == 0:
+                ssim_val, psnr_val = compute_metrics(real_data, fake_data)
+
+        # Print loss and metrics
+        print(f"Training Epoch [{epoch}/{n_epochs}] D Loss: {d_loss.item():.4f} G Loss: {g_loss.item():.4f}, "
+              f"SSIM: {ssim_val:.4f}, PSNR: {psnr_val:.4f}")
+
+        # Visualize and save
+        if epoch % 50 == 0:
+            with torch.no_grad():
+                z = torch.randn(1, latent_dim).to(device)
+                fake_data = generator(z)
+                visualize_samples(real_data[:1], fake_data, epoch, None, save_dir)
+                
+    # Save final models
+    torch.save(generator.state_dict(), os.path.join(save_dir, 'generator_final.pth'))
+    torch.save(discriminator.state_dict(), os.path.join(save_dir, 'discriminator_final.pth'))
+    print(f"Training complete! Final models and visualizations saved to: {os.path.abspath(save_dir)}")
